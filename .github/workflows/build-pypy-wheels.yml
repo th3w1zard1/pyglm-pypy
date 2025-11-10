@@ -1,0 +1,214 @@
+name: Build PyPy Wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Git tag to create or update
+        required: true
+        default: v2.8.2-pypy
+      release_title:
+        description: Title used when creating or updating the release
+        required: true
+        default: PyGLM 2.8.2 for PyPy
+      release_notes:
+        description: Release notes applied when creating or overwriting the release body
+        required: true
+        default: Patched build for PyPy compatibility across supported interpreters.
+  push:
+    tags:
+      - 'v*'
+
+env:
+  SOURCE_DIR: pyglm-2.8.2
+  DIST_DIR: pyglm-2.8.2/dist
+
+jobs:
+  build:
+    name: Build ${{ matrix.identifier }}
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            python-version: pypy-3.9
+            architecture: x64
+            identifier: linux-pp39-x64
+            experimental: false
+          - runner: ubuntu-latest
+            python-version: pypy-3.10
+            architecture: x64
+            identifier: linux-pp310-x64
+            experimental: false
+          - runner: ubuntu-latest
+            python-version: pypy-3.11
+            architecture: x64
+            identifier: linux-pp311-x64
+            experimental: true
+          - runner: ubuntu-22.04-arm
+            python-version: pypy-3.9
+            architecture: arm64
+            identifier: linux-pp39-arm64
+            experimental: false
+          - runner: ubuntu-22.04-arm
+            python-version: pypy-3.10
+            architecture: arm64
+            identifier: linux-pp310-arm64
+            experimental: false
+          - runner: ubuntu-22.04-arm
+            python-version: pypy-3.11
+            architecture: arm64
+            identifier: linux-pp311-arm64
+            experimental: true
+          - runner: macos-13
+            python-version: pypy-3.9
+            architecture: x64
+            identifier: macos-pp39-x64
+            experimental: false
+          - runner: macos-13
+            python-version: pypy-3.10
+            architecture: x64
+            identifier: macos-pp310-x64
+            experimental: false
+          - runner: macos-13
+            python-version: pypy-3.11
+            architecture: x64
+            identifier: macos-pp311-x64
+            experimental: true
+          - runner: macos-14
+            python-version: pypy-3.9
+            architecture: arm64
+            identifier: macos-pp39-arm64
+            experimental: false
+          - runner: macos-14
+            python-version: pypy-3.10
+            architecture: arm64
+            identifier: macos-pp310-arm64
+            experimental: false
+          - runner: macos-14
+            python-version: pypy-3.11
+            architecture: arm64
+            identifier: macos-pp311-arm64
+            experimental: true
+          - runner: windows-latest
+            python-version: pypy-3.9
+            architecture: x64
+            identifier: windows-pp39-x64
+            experimental: false
+          - runner: windows-latest
+            python-version: pypy-3.10
+            architecture: x64
+            identifier: windows-pp310-x64
+            experimental: false
+          - runner: windows-latest
+            python-version: pypy-3.11
+            architecture: x64
+            identifier: windows-pp311-x64
+            experimental: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up PyPy
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: ${{ matrix.architecture }}
+
+      - name: Upgrade pip tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade setuptools wheel build
+
+      - name: Ensure clean dist directory
+        run: |
+          python - <<'PY'
+          import pathlib
+          import shutil
+
+          dist = pathlib.Path(r"${{ env.DIST_DIR }}")
+          if dist.exists():
+              shutil.rmtree(dist)
+          dist.mkdir(parents=True, exist_ok=True)
+          PY
+
+      - name: Build wheel
+        working-directory: ${{ env.SOURCE_DIR }}
+        run: python -m build --wheel
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.identifier }}
+          path: ${{ env.DIST_DIR }}/*.whl
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Verify build matrix status
+        if: ${{ needs.build.result != 'success' }}
+        shell: bash
+        run: |
+          echo "Build matrix concluded with status: ${{ needs.build.result }}." >&2
+          exit 1
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Collect release metadata
+        id: release
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ github.event.inputs.release_tag }}"
+            TITLE="${{ github.event.inputs.release_title }}"
+            NOTES="${{ github.event.inputs.release_notes }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+            TITLE="$TAG"
+            NOTES="Automated PyPy wheel build for $TAG."
+          fi
+
+          if [[ -z "$TAG" ]]; then
+            echo "Tag name could not be determined." >&2
+            exit 1
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "title=$TITLE"
+            printf 'notes<<EOF\n%s\nEOF\n' "$NOTES"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+          TITLE: ${{ steps.release.outputs.title }}
+          NOTES: ${{ steps.release.outputs.notes }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(dist/*.whl)
+          if (( ${#files[@]} == 0 )); then
+            echo "No wheel artifacts were produced; skipping release upload."
+            exit 0
+          fi
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" "${files[@]}" --title "$TITLE" --notes "$NOTES"
+          else
+            gh release upload "$TAG" "${files[@]}" --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES"
+          fi
+
